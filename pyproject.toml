@@ -16,6 +16,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "pandas>=2",
+    "ipython>=9.4.0",
+    "sortedcontainers>=2.4.0",
 ]
 
 [tool.setuptools.packages.find]
