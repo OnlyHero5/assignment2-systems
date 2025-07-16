@@ -1,7 +1,9 @@
 from collections import defaultdict
 import dataclasses
+import itertools
 import statistics
 import timeit
+from typing import List, Tuple
 
 import pandas as pd
 
@@ -20,34 +22,47 @@ class BenchmarkParams:
     batch_size: int = 32
     include_backward: bool = True
 
+def _single_model_run(model, params, data_loader) -> List[Tuple[str, float]]:
+    metrics = []
+    with nvtx.range("full run"):
+        model.train()
+        model.zero_grad()
+
+        samples, targets = data_loader.create_training_batch(params.batch_size, model.params.context_length, params.device)
+        start = timeit.default_timer()
+
+        with nvtx.range("forward pass"):
+            predictions = model(samples)
+            torch.cuda.synchronize()
+
+        end = timeit.default_timer()
+        metrics.append(("forward", end - start))
+
+        if params.include_backward:
+            start = timeit.default_timer()
+            
+            with nvtx.range("backward pass"):
+                loss = cross_entropy(predictions, targets).mean()
+                loss.backward()
+                torch.cuda.synchronize()
+
+            end = timeit.default_timer()
+            metrics.append(("backward", end - start))
+
+    return metrics
+
 def run_single_benchmark(benchmark_params: BenchmarkParams, hyperparams, data_loader) -> pd.DataFrame:
     model = TransformerLM(hyperparams)
 
     with nvtx.range("warmup"):
         for _ in range(benchmark_params.n_warmup):
-            samples, _ = data_loader.create_training_batch(benchmark_params.batch_size, hyperparams.context_length, benchmark_params.device)
-            model(samples)
-        torch.cuda.synchronize()
+            _single_model_run(model, benchmark_params, data_loader)
 
-    metrics = []
-    for _ in range(benchmark_params.n_runs):
-        model.train()
-        model.zero_grad()
 
-        samples, targets = data_loader.create_training_batch(benchmark_params.batch_size, hyperparams.context_length, benchmark_params.device)
-        start = timeit.default_timer()
-        predictions = model(samples)
-        torch.cuda.synchronize()
-        end = timeit.default_timer()
-        metrics.append(("forward", end - start))
-
-        if benchmark_params.include_backward:
-            start = timeit.default_timer()
-            loss = cross_entropy(predictions, targets).mean()
-            loss.backward()
-            torch.cuda.synchronize()
-            end = timeit.default_timer()
-            metrics.append(("backward", end - start))
+    with nvtx.range("real runs"):
+        metrics = itertools.chain(
+            _single_model_run(model, benchmark_params, data_loader)
+            for _ in range(benchmark_params.n_runs))
 
     return pd.DataFrame.from_records({
         "action": action,
@@ -62,7 +77,10 @@ def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, data_load
 
     all_runs = []
     for hp in all_hyperparams:
-        hp_runs = run_single_benchmark(benchmark_params, hp, data_loader)
+        annotations = ", ".join(f"{field}={getattr(hp, field)}" for field in swept_fields)
+        with nvtx.range(f"benchmark ({annotations})"):
+            hp_runs = run_single_benchmark(benchmark_params, hp, data_loader)
+
         for field in swept_fields:
             hp_runs[field] = getattr(hp, field)
         all_runs.append(hp_runs)
@@ -103,5 +121,5 @@ if __name__ == "__main__":
 
     results = run_benchmarks(params, all_hyperparams, data_loader)
 
-    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"]))
-    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"], aggfunc=statistics.stdev))
+    # print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"]))
+    # print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"], aggfunc=statistics.stdev))
