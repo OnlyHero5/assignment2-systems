@@ -158,8 +158,8 @@ class RoPE(torch.nn.Module):
 
     @nvtx.range("RoPE")
     def forward(self, x: Float[Tensor, "... seq_len d_k"], token_positions: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len d_k"]:
-        cos_slice: Float[Tensor, "... seq_len d_k"] = self.get_buffer("cos")[token_positions,:]
-        sin_slice: Float[Tensor, "... seq_len d_k"] = self.get_buffer("sin")[token_positions,:]
+        cos_slice: Float[Tensor, "seq_len d_k"] = self.get_buffer("cos")[token_positions,:]
+        sin_slice: Float[Tensor, "seq_len d_k"] = self.get_buffer("sin")[token_positions,:]
 
         # swap each pair of indices before multiplying with sins
         swapped_pairs: Float[Tensor, "... seq_len d_k"] = x[...,self.get_buffer("pair_swaps")]
@@ -287,8 +287,13 @@ class CausalMultiHeadAttention(torch.nn.Module):
         if self.rope is not None:
             if token_positions is None:
                 token_positions = torch.arange(queries.shape[-2])
-            queries = self.rope(queries, token_positions)
-            keys = self.rope(keys, token_positions)
+            
+            combined_inputs: Float[Tensor, "2 ... n_head seq_len d_k"] = torch.cat((queries.unsqueeze(0), keys.unsqueeze(0)))
+            combined_rope_results = self.rope(combined_inputs, token_positions)
+            queries = combined_rope_results[0]
+            keys = combined_rope_results[1]
+            # queries = self.rope(queries, token_positions)
+            # keys = self.rope(keys, token_positions)
 
         attention_mask: Bool[Tensor, "query_len key_len"] = self.get_buffer("mask_buffer")[:queries.shape[-2],:keys.shape[-2]]
         multi_head_context_vectors: Float[Tensor, "... n_head query_len d_k"] = attention(queries, keys, values, mask=attention_mask)
@@ -342,6 +347,7 @@ class TransformerBlock(torch.nn.Module):
             ]
         }) # type: ignore
 
+    @nvtx.range("transformer block")
     def forward(self, x: Float[Tensor, "... seq_len d_in"]) -> Float[Tensor, "... seq_len d_out"]:
         context_vectors = self.attention(self.attention_norm(x))
         context_vectors = context_vectors + x

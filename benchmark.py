@@ -1,17 +1,18 @@
-from collections import defaultdict
+from contextlib import nullcontext
 import dataclasses
 import itertools
 import statistics
 import timeit
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
+from optimizers import AdamW, AdamWParams
 import pandas as pd
 
 import torch
 import torch.cuda.nvtx as nvtx
 
 from llm import LMHyperparams, TransformerLM
-from train import CachingTextFileLoader, load_sweep_params, TokenizerLoader
+from train import CachingTextFileLoader, load_params, load_sweep_params, TokenizerLoader
 from training import cross_entropy
 
 @dataclasses.dataclass
@@ -21,16 +22,17 @@ class BenchmarkParams:
     n_runs: int
     batch_size: int = 32
     include_backward: bool = True
+    include_optimizer: bool = False
+    autocast_dtype: Optional[str] = None
 
-def _single_model_run(model, params, data_loader) -> List[Tuple[str, float]]:
+def _single_model_run(model, params, optimizer, data_loader) -> List[Tuple[str, float]]:
     metrics = []
+    samples, targets = data_loader.create_training_batch(params.batch_size, model.params.context_length, params.device)
+    model.train()
+    model.zero_grad()
+
     with nvtx.range("full run"):
-        model.train()
-        model.zero_grad()
-
-        samples, targets = data_loader.create_training_batch(params.batch_size, model.params.context_length, params.device)
         start = timeit.default_timer()
-
         with nvtx.range("forward pass"):
             predictions = model(samples)
             torch.cuda.synchronize()
@@ -49,41 +51,61 @@ def _single_model_run(model, params, data_loader) -> List[Tuple[str, float]]:
             end = timeit.default_timer()
             metrics.append(("backward", end - start))
 
+            if params.include_optimizer:
+                start = timeit.default_timer()
+                
+                with nvtx.range("optimizer step"):
+                    optimizer.step()
+                    torch.cuda.synchronize()
+
+                end = timeit.default_timer()
+                metrics.append(("backward", end - start))
+
     return metrics
 
-def run_single_benchmark(benchmark_params: BenchmarkParams, hyperparams, data_loader) -> pd.DataFrame:
+def run_single_benchmark(benchmark_params: BenchmarkParams, hyperparams, optimizer_params, data_loader) -> pd.DataFrame:
     model = TransformerLM(hyperparams)
+    optimizer = None
+    if optimizer_params is not None:
+        optimizer = AdamW(model.parameters(), optimizer_params)
 
     with nvtx.range("warmup"):
         for _ in range(benchmark_params.n_warmup):
-            _single_model_run(model, benchmark_params, data_loader)
+            _single_model_run(model, benchmark_params, optimizer, data_loader)
 
 
     with nvtx.range("real runs"):
         metrics = itertools.chain(
-            _single_model_run(model, benchmark_params, data_loader)
-            for _ in range(benchmark_params.n_runs))
+            *(_single_model_run(model, benchmark_params, optimizer, data_loader)
+            for _ in range(benchmark_params.n_runs)))
 
     return pd.DataFrame.from_records({
         "action": action,
         "t": t,
     } for action, t in metrics)
 
-def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, data_loader):
+def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, optimizer_params, data_loader):
     swept_fields = [
         field.name for field in dataclasses.fields(LMHyperparams) if
         len(set(getattr(h, field.name) for h in all_hyperparams)) > 1
     ]
 
     all_runs = []
-    for hp in all_hyperparams:
-        annotations = ", ".join(f"{field}={getattr(hp, field)}" for field in swept_fields)
-        with nvtx.range(f"benchmark ({annotations})"):
-            hp_runs = run_single_benchmark(benchmark_params, hp, data_loader)
 
-        for field in swept_fields:
-            hp_runs[field] = getattr(hp, field)
-        all_runs.append(hp_runs)
+    dtype_context = nullcontext()
+    if benchmark_params.autocast_dtype is not None:
+        dtype_context = torch.autocast(device_type=benchmark_params.device, dtype=getattr(torch, benchmark_params.autocast_dtype))
+
+    with dtype_context:
+        for hp in all_hyperparams:
+            annotations = ", ".join(f"{field}={getattr(hp, field)}" for field in swept_fields)
+            with nvtx.range(f"benchmark ({annotations})"):
+                hp_runs = run_single_benchmark(benchmark_params, hp, optimizer_params, data_loader)
+
+            for field in swept_fields:
+                hp_runs[field] = getattr(hp, field)
+            all_runs.append(hp_runs)
+
     df = pd.concat(all_runs)
 
     return df
@@ -95,9 +117,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--hyperparams", nargs="?", default="hyperparams.json")
+    parser.add_argument("--optimizer-params", nargs="?", default="optimizer.json")
     parser.add_argument("--training-data", default="TinyStoriesV2-GPT4-train.txt")
     parser.add_argument("--tokenizer-path", default="tokenizer.pkl")
     parser.add_argument("--include-backward", action="store_true")
+    parser.add_argument("--include-optimizer", action="store_true")
+    parser.add_argument("--autocast")
     parser.add_argument("--device")
 
     args = parser.parse_args()
@@ -112,14 +137,21 @@ if __name__ == "__main__":
     data_loader = CachingTextFileLoader(tokenizer, args.training_data)
 
     all_hyperparams = list(load_sweep_params(LMHyperparams, args.hyperparams))
+
+    optimizer_params = None
+    if args.include_optimizer:
+        optimizer_params = load_params(AdamWParams, args.optimizer_params)
+
     params = BenchmarkParams(
         device=device,
         n_warmup=args.warmup,
         n_runs=10,
         include_backward=args.include_backward,
+        include_optimizer=args.include_optimizer,
+        autocast_dtype=args.autocast,
     )
 
-    results = run_benchmarks(params, all_hyperparams, data_loader)
+    results = run_benchmarks(params, all_hyperparams, optimizer_params, data_loader)
 
-    # print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"]))
-    # print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"], aggfunc=statistics.stdev))
+    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"]))
+    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"], aggfunc=statistics.stdev))

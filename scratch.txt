@@ -1,0 +1,1 @@
+uv run --no-sync nsys profile -o benchmark --pytorch=autograd-nvtx --python-backtrace=cuda --force-overwrite=true python benchmark.py --device cuda --include-backward
