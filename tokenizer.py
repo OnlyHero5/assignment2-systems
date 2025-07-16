@@ -12,7 +12,7 @@ import regex as re
 from sortedcontainers import SortedSet
 from tqdm import tqdm
 
-from cs336_basics.pretokenization_example import find_chunk_boundaries
+from pretokenization_example import find_chunk_boundaries
 
 @dataclass
 class BPEParams:

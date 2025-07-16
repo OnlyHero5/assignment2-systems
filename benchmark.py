@@ -6,10 +6,11 @@ import timeit
 import pandas as pd
 
 import torch
+import torch.cuda.nvtx as nvtx
 
-from cs336_basics.llm import LMHyperparams, TransformerLM
-from cs336_basics.train import CachingTextFileLoader, load_sweep_params, TokenizerLoader
-from cs336_basics.training import cross_entropy
+from llm import LMHyperparams, TransformerLM
+from train import CachingTextFileLoader, load_sweep_params, TokenizerLoader
+from training import cross_entropy
 
 @dataclasses.dataclass
 class BenchmarkParams:
@@ -22,10 +23,11 @@ class BenchmarkParams:
 def run_single_benchmark(benchmark_params: BenchmarkParams, hyperparams, data_loader) -> pd.DataFrame:
     model = TransformerLM(hyperparams)
 
-    for _ in range(benchmark_params.n_warmup):
-        samples, _ = data_loader.create_training_batch(benchmark_params.batch_size, hyperparams.context_length, benchmark_params.device)
-        model(samples)
-    torch.cuda.synchronize()
+    with nvtx.range("warmup"):
+        for _ in range(benchmark_params.n_warmup):
+            samples, _ = data_loader.create_training_batch(benchmark_params.batch_size, hyperparams.context_length, benchmark_params.device)
+            model(samples)
+        torch.cuda.synchronize()
 
     metrics = []
     for _ in range(benchmark_params.n_runs):

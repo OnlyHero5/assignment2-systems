@@ -17,11 +17,11 @@ from torch import Tensor
 from tqdm import tqdm
 import wandb
 
-from .generation import generate_text
-from .llm import LMHyperparams, TransformerLM
-from .optimizers import AdamW, AdamWParams, clip_gradients
-from .tokenizer import Tokenizer, BPETokenizer, TokenizerTrainer
-from .training import load_checkpoint, save_checkpoint, create_training_batch, cross_entropy
+from generation import generate_text
+from llm import LMHyperparams, TransformerLM
+from optimizers import AdamW, AdamWParams, clip_gradients
+from tokenizer import Tokenizer, BPETokenizer, TokenizerTrainer
+from training import load_checkpoint, save_checkpoint, create_training_batch, cross_entropy
 
 class DataLoader(ABC):
     @abstractmethod

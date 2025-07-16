@@ -4,8 +4,8 @@ from tqdm import tqdm
 
 from jaxtyping import Int, Float
 
-from .llm import softmax, TransformerLM
-from .tokenizer import Tokenizer
+from llm import softmax, TransformerLM
+from tokenizer import Tokenizer
 
 def get_nucleus_sample(probs: Float[Tensor, "vocab_size"], target_p: float) -> Float[Tensor, "n_nucleus"]:
     sorted_values, indices = torch.sort(probs, dim=-1, descending=True)
