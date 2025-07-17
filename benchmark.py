@@ -3,7 +3,9 @@ import dataclasses
 import itertools
 import statistics
 import timeit
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Literal, Optional, Tuple, Union
+
+from jaxtyping import Float
 
 from optimizers import AdamW, AdamWParams
 import pandas as pd
@@ -106,25 +108,20 @@ class AttentionRun:
     def __call__(self) -> MetricsList:
         metrics = []
 
-        q = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
-        k = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
-        v = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
+        def create_input():
+            return torch.rand(self.hyperparams.context_length, self.hyperparams.d_model, requires_grad=self.benchmark_params.include_backward)
 
         with timer_context("forward", metrics):
-            loss = self.attention_fn(q, k, v).mean()
+            loss = self.attention_fn(*(create_input() for _ in range(3))).mean()
         
-        with timer_context("backward", metrics, "attention backward"):
-            loss.backward()
+        if self.benchmark_params.include_backward:
+            with timer_context("backward", metrics, "attention backward"):
+                loss.backward()
 
         return metrics
 
 
-def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, optimizer_params, data_loader):
-    swept_fields = [
-        field.name for field in dataclasses.fields(LMHyperparams) if
-        len(set(getattr(h, field.name) for h in all_hyperparams)) > 1
-    ]
-
+def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams: Iterable[LMHyperparams], swept_fields: List[str], optimizer_params, data_loader):
     all_runs = []
 
     dtype_context = nullcontext()
@@ -201,12 +198,12 @@ if __name__ == "__main__":
         autocast_dtype=args.autocast,
     )
 
-    results = run_benchmarks(params, all_hyperparams, optimizer_params, data_loader)
-
     swept_fields = [
         field.name for field in dataclasses.fields(LMHyperparams) if
         len(set(getattr(h, field.name) for h in all_hyperparams)) > 1
     ]
+
+    results = run_benchmarks(params, all_hyperparams, swept_fields, optimizer_params, data_loader)
 
     print(results.pivot_table(index=swept_fields, columns=["action"], values=["t"]))
     print(results.pivot_table(index=swept_fields, columns=["action"], values=["t"], aggfunc=statistics.stdev))
