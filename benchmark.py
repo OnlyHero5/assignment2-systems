@@ -1,9 +1,9 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import dataclasses
 import itertools
 import statistics
 import timeit
-from typing import List, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 from optimizers import AdamW, AdamWParams
 import pandas as pd
@@ -11,12 +11,13 @@ import pandas as pd
 import torch
 import torch.cuda.nvtx as nvtx
 
-from llm import LMHyperparams, TransformerLM
+from llm import attention, LMHyperparams, TransformerLM
 from train import CachingTextFileLoader, load_params, load_sweep_params, TokenizerLoader
 from training import cross_entropy
 
 @dataclasses.dataclass
 class BenchmarkParams:
+    operation: str
     device: str
     n_warmup: int
     n_runs: int
@@ -25,64 +26,98 @@ class BenchmarkParams:
     include_optimizer: bool = False
     autocast_dtype: Optional[str] = None
 
-def _single_model_run(model, params, optimizer, data_loader) -> List[Tuple[str, float]]:
-    metrics = []
-    samples, targets = data_loader.create_training_batch(params.batch_size, model.params.context_length, params.device)
-    model.train()
-    model.zero_grad()
+compiled_attention = torch.compile(attention)
+MetricsList = List[Tuple[str, float]]
 
-    with nvtx.range("full run"):
-        start = timeit.default_timer()
-        with nvtx.range("forward pass"):
-            predictions = model(samples)
-            torch.cuda.synchronize()
+@contextmanager
+def timer_context(operation: str, metrics: Optional[MetricsList] = None, nvtx_range: Optional[str] = None):
+    if nvtx_range is not None:
+        nvtx_context = nvtx.range(nvtx_range)
+    else:
+        nvtx_context = nullcontext()
 
-        end = timeit.default_timer()
-        metrics.append(("forward", end - start))
-
-        if params.include_backward:
+    with nvtx_context:
+        try:
             start = timeit.default_timer()
-            
-            with nvtx.range("backward pass"):
-                loss = cross_entropy(predictions, targets).mean()
-                loss.backward()
-                torch.cuda.synchronize()
-
+            yield None
+        finally:
             end = timeit.default_timer()
-            metrics.append(("backward", end - start))
+            if metrics is not None:
+                metrics.append((operation, end - start))
 
-            if params.include_optimizer:
-                start = timeit.default_timer()
-                
-                with nvtx.range("optimizer step"):
-                    optimizer.step()
-                    torch.cuda.synchronize()
 
-                end = timeit.default_timer()
-                metrics.append(("backward", end - start))
-
-    return metrics
-
-def run_single_benchmark(benchmark_params: BenchmarkParams, hyperparams, optimizer_params, data_loader) -> pd.DataFrame:
-    model = TransformerLM(hyperparams)
-    optimizer = None
-    if optimizer_params is not None:
-        optimizer = AdamW(model.parameters(), optimizer_params)
-
+def run_single_benchmark(benchmark_params: BenchmarkParams, run: Callable[[], MetricsList]) -> pd.DataFrame:
     with nvtx.range("warmup"):
         for _ in range(benchmark_params.n_warmup):
-            _single_model_run(model, benchmark_params, optimizer, data_loader)
-
+            run()
 
     with nvtx.range("real runs"):
-        metrics = itertools.chain(
-            *(_single_model_run(model, benchmark_params, optimizer, data_loader)
-            for _ in range(benchmark_params.n_runs)))
+        metrics = itertools.chain(*(run() for _ in range(benchmark_params.n_runs)))
 
     return pd.DataFrame.from_records({
         "action": action,
         "t": t,
     } for action, t in metrics)
+
+
+class FullModelRun:
+    def __init__(self, benchmark_params, hp, optimizer_params, data_loader):
+        self.hyperparams = hp
+        self.optimizer_params = optimizer_params
+        self.data_loader = data_loader
+
+        self.model = TransformerLM(self.hyperparams)
+        self.optimizer = None
+        if self.optimizer_params is not None:
+            self.optimizer = AdamW(self.model.parameters(), self.optimizer_params)
+
+    def __call__(self) -> MetricsList:
+        metrics = []
+        samples, targets = data_loader.create_training_batch(params.batch_size, self.model.params.context_length, params.device)
+        self.model.train()
+        self.model.zero_grad()
+
+        with nvtx.range("full run"):
+            with timer_context("forward", metrics, "forward pass"):
+                predictions = self.model(samples)
+                torch.cuda.synchronize()
+
+            if params.include_backward:
+                with timer_context("backward", metrics, "backward pass"):
+                    loss = cross_entropy(predictions, targets).mean()
+                    loss.backward()
+                    torch.cuda.synchronize()
+
+                if self.optimizer is not None:
+                    with timer_context("optimize", metrics, "optimizer step"):
+                        self.optimizer.step()
+                        torch.cuda.synchronize()
+
+        return metrics
+
+
+class AttentionRun:
+    def __init__(self, benchmark_params, hyperparams: LMHyperparams):
+        self.benchmark_params = benchmark_params
+        self.hyperparams = hyperparams
+
+        self.attention_fn = compiled_attention if compile else attention
+
+    def __call__(self) -> MetricsList:
+        metrics = []
+
+        q = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
+        k = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
+        v = torch.rand(self.hyperparams.context_length, self.hyperparams.d_model)
+
+        with timer_context("forward", metrics):
+            loss = self.attention_fn(q, k, v).mean()
+        
+        with timer_context("backward", metrics, "attention backward"):
+            loss.backward()
+
+        return metrics
+
 
 def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, optimizer_params, data_loader):
     swept_fields = [
@@ -99,12 +134,24 @@ def run_benchmarks(benchmark_params: BenchmarkParams, all_hyperparams, optimizer
     with dtype_context:
         for hp in all_hyperparams:
             annotations = ", ".join(f"{field}={getattr(hp, field)}" for field in swept_fields)
-            with nvtx.range(f"benchmark ({annotations})"):
-                hp_runs = run_single_benchmark(benchmark_params, hp, optimizer_params, data_loader)
 
-            for field in swept_fields:
-                hp_runs[field] = getattr(hp, field)
-            all_runs.append(hp_runs)
+            if benchmark_params.operation == "full":
+                runner = FullModelRun(benchmark_params, hp, optimizer_params, data_loader)
+            elif benchmark_params.operation == "attention":
+                runner = AttentionRun(benchmark_params, hp)
+            else:
+                raise ValueError("unknown benchmark type")
+
+            try:
+                with nvtx.range(f"benchmark ({annotations})"):
+                    hp_runs = run_single_benchmark(benchmark_params, runner)
+            except torch.OutOfMemoryError:
+                print(f"configuration {annotations} caused CUDA OOM")
+            else:
+                for field in swept_fields:
+                    hp_runs[field] = getattr(hp, field)
+
+                all_runs.append(hp_runs)
 
     df = pd.concat(all_runs)
 
@@ -115,7 +162,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("operation", choices=["full", "attention"], default="full")
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--n-run", type=int, default=10)
     parser.add_argument("--hyperparams", nargs="?", default="hyperparams.json")
     parser.add_argument("--optimizer-params", nargs="?", default="optimizer.json")
     parser.add_argument("--training-data", default="TinyStoriesV2-GPT4-train.txt")
@@ -143,9 +192,10 @@ if __name__ == "__main__":
         optimizer_params = load_params(AdamWParams, args.optimizer_params)
 
     params = BenchmarkParams(
+        operation=args.operation,
         device=device,
         n_warmup=args.warmup,
-        n_runs=10,
+        n_runs=args.n_run,
         include_backward=args.include_backward,
         include_optimizer=args.include_optimizer,
         autocast_dtype=args.autocast,
@@ -153,5 +203,10 @@ if __name__ == "__main__":
 
     results = run_benchmarks(params, all_hyperparams, optimizer_params, data_loader)
 
-    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"]))
-    print(results.pivot_table(index=["d_model", "n_layers"], columns=["action"], values=["t"], aggfunc=statistics.stdev))
+    swept_fields = [
+        field.name for field in dataclasses.fields(LMHyperparams) if
+        len(set(getattr(h, field.name) for h in all_hyperparams)) > 1
+    ]
+
+    print(results.pivot_table(index=swept_fields, columns=["action"], values=["t"]))
+    print(results.pivot_table(index=swept_fields, columns=["action"], values=["t"], aggfunc=statistics.stdev))
