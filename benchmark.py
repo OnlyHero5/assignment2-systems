@@ -43,6 +43,7 @@ def timer_context(operation: str, metrics: Optional[MetricsList] = None, nvtx_ra
             start = timeit.default_timer()
             yield None
         finally:
+            torch.cuda.synchronize()
             end = timeit.default_timer()
             if metrics is not None:
                 metrics.append((operation, end - start))
@@ -82,18 +83,15 @@ class FullModelRun:
         with nvtx.range("full run"):
             with timer_context("forward", metrics, "forward pass"):
                 predictions = self.model(samples)
-                torch.cuda.synchronize()
 
             if params.include_backward:
                 with timer_context("backward", metrics, "backward pass"):
                     loss = cross_entropy(predictions, targets).mean()
                     loss.backward()
-                    torch.cuda.synchronize()
 
                 if self.optimizer is not None:
                     with timer_context("optimize", metrics, "optimizer step"):
                         self.optimizer.step()
-                        torch.cuda.synchronize()
 
         return metrics
 
