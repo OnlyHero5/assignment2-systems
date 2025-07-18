@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 from typing import Any, Dict, List, Optional, Self, TypeVar
@@ -7,6 +8,23 @@ from jaxtyping import Float, Int, Bool
 import torch
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
+
+if torch.cuda.is_available():
+    nvtx_range = nvtx.range # type: ignore
+else:
+    class nvtx_range:
+        def __init__(self, _):
+            pass
+
+        def __call__(self, f):
+            # when called as a decorator, just return the base function
+            return f
+
+        def __enter__(self, *args, **kwargs):
+            pass
+
+        def __exit__(self, *args, **kwargs):
+            pass
 
 @dataclass
 class LMHyperparams:
@@ -80,7 +98,7 @@ class RMSNorm(torch.nn.Module):
 
         self.weights = torch.nn.Parameter(torch.ones(self.d_model))
 
-    @nvtx.range("rms norm")
+    @nvtx_range("rms norm")
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         original_dtype = x.dtype
         x.to(torch.float32)
@@ -108,7 +126,7 @@ class SwiGLU(torch.nn.Module):
 
         self.einsum = False
 
-    @nvtx.range("swiglu")
+    @nvtx_range("swiglu")
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
         if self.einsum:
             p1: Float[Tensor, "... d_ff"] = einsum(x, self.w1, "... d_model, d_ff d_model-> ... d_ff")
@@ -156,7 +174,7 @@ class RoPE(torch.nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("pair_swaps", pair_swaps, persistent=False)
 
-    @nvtx.range("RoPE")
+    @nvtx_range("RoPE")
     def forward(self, x: Float[Tensor, "... seq_len d_k"], token_positions: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len d_k"]:
         cos_slice: Float[Tensor, "seq_len d_k"] = self.get_buffer("cos")[token_positions,:]
         sin_slice: Float[Tensor, "seq_len d_k"] = self.get_buffer("sin")[token_positions,:]
@@ -182,7 +200,7 @@ class RoPE(torch.nn.Module):
         return result
 
 
-@nvtx.range("softmax")
+@nvtx_range("softmax")
 def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
     max_values = x.max(dim=dim, keepdim=True).values
     adjusted: Float[Tensor, "..."] = x - max_values
@@ -191,7 +209,7 @@ def softmax(x: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
     return exps / denoms
 
 
-@nvtx.range("attention")
+@nvtx_range("attention")
 def attention(
         queries: Float[Tensor, "... query_len d_k"],
         keys: Float[Tensor, "... key_len d_k"],
@@ -202,25 +220,25 @@ def attention(
 
     d_k: int = keys.shape[-1]
 
-    with nvtx.range("attention qk matmul"):
+    with nvtx_range("attention qk matmul"):
         product: Float[Tensor, "... query_len key_len"] = einsum(
             queries,
             keys,
             "... query_len d_k, ... key_len d_k -> ... query_len key_len"
         )
 
-    with nvtx.range("attention scaling"):
+    with nvtx_range("attention scaling"):
         scaled_product: Float[Tensor, "... query_len key_len"] = product / math.sqrt(d_k)
     
-    with nvtx.range("attention masking"):
+    with nvtx_range("attention masking"):
         masked_product: Float[Tensor, "... query_len key_len"] = scaled_product
         if mask is not None:
             masked_product = masked_product.where(mask, -torch.inf)
 
-    with nvtx.range("attention softmax"):
+    with nvtx_range("attention softmax"):
         attention_ratios = softmax(masked_product, dim=-1)
 
-    with nvtx.range("attention final matmul"):
+    with nvtx_range("attention final matmul"):
         result: Float[Tensor, "... query_len d_v"] = einsum(
             attention_ratios,
             values,
@@ -255,16 +273,16 @@ class CausalMultiHeadAttention(torch.nn.Module):
         self.rope: Optional[RoPE] = RoPE(theta=rope_theta, d_k=self.d_k, context_length=self.context_length) if rope_theta is not None else None
 
 
-    @nvtx.range("causal multi-head attention")
+    @nvtx_range("causal multi-head attention")
     def forward(self,
                 x: Float[Tensor, "... seq_len d_in"],
                 token_positions: Optional[Int[Tensor, "... seq_len"]] = None
                 ) -> Float[Tensor, "... seq_len d_out"]:
         # squeeze all weights (q, k, v) into a single concatenated matrix so that we can evaluate in a single matmul...
-        with nvtx.range("concatting weights"):
+        with nvtx_range("concatting weights"):
             all_weights: Float[Tensor, "d_out_all d_in"] = torch.concat([self.weights_q, self.weights_k, self.weights_v], dim=-2)
 
-        with nvtx.range("computing qkv"):
+        with nvtx_range("computing qkv"):
             full_products: Float[Tensor, "... seq_len d_out_all"] = einsum(
                 x,
                 all_weights,
@@ -272,14 +290,14 @@ class CausalMultiHeadAttention(torch.nn.Module):
             )
 
         # ... and then split them back into their respective components
-        with nvtx.range("splitting weights"):
+        with nvtx_range("splitting weights"):
             full_queries, full_keys, full_values = torch.split(full_products, self.d_out, dim=-1)
 
         # then split each component into individual heads
         def multi_head_split(full: Float[Tensor, "... seq_len d_out"]) -> Float[Tensor, "... n_head seq_len d_k"]:
             return rearrange(full, "... seq_len (n_head d_k) -> ... n_head seq_len d_k", n_head=self.n_heads, d_k=self.d_k)
 
-        with nvtx.range("splitting attention heads"):
+        with nvtx_range("splitting attention heads"):
             queries = multi_head_split(full_queries)
             keys = multi_head_split(full_keys)
             values = multi_head_split(full_values)
@@ -298,13 +316,13 @@ class CausalMultiHeadAttention(torch.nn.Module):
         attention_mask: Bool[Tensor, "query_len key_len"] = self.get_buffer("mask_buffer")[:queries.shape[-2],:keys.shape[-2]]
         multi_head_context_vectors: Float[Tensor, "... n_head query_len d_k"] = attention(queries, keys, values, mask=attention_mask)
 
-        with nvtx.range("recombining attention heads"):
+        with nvtx_range("recombining attention heads"):
             merged_context_vectors: Float[Tensor, "... query_len d_out"] = rearrange(
                 multi_head_context_vectors,
                 "... n_head query_len d_k -> ... query_len (n_head d_k)"
             )
 
-        with nvtx.range("computing context vectors"):
+        with nvtx_range("computing context vectors"):
             result: Float[Tensor, "... query_len d_out"] = einsum(
                 merged_context_vectors,
                 self.weights_o,
@@ -347,7 +365,7 @@ class TransformerBlock(torch.nn.Module):
             ]
         }) # type: ignore
 
-    @nvtx.range("transformer block")
+    @nvtx_range("transformer block")
     def forward(self, x: Float[Tensor, "... seq_len d_in"]) -> Float[Tensor, "... seq_len d_out"]:
         context_vectors = self.attention(self.attention_norm(x))
         context_vectors = context_vectors + x
@@ -386,13 +404,13 @@ class TransformerLM(torch.nn.Module):
         self.output_layer = Linear(dim_in=self.params.d_model, dim_out=self.params.vocab_size)
 
     def forward(self, x: Int[Tensor, "... seq_len"]) -> Int[Tensor, "... seq_len vocab_size"]:
-        with nvtx.range("input embeddings"):
+        with nvtx_range("input embeddings"):
             embeddings_in: Float[Tensor, "... seq_len d_model"] = self.embedding(x)
         
-        with nvtx.range("attention layers"):
+        with nvtx_range("attention layers"):
             embeddings_out: Float[Tensor, "... seq_len d_model"] = self.transformers_module(embeddings_in)
         
-        with nvtx.range("final output layer"):
+        with nvtx_range("final output layer"):
             output_logits: Float[Tensor, "... seq_len vocab_size"] = self.output_layer(self.output_norm(embeddings_out))
 
         # !!! diagram shows softmax before output, but expected test values are the raw (pre-softmax) values
