@@ -20,6 +20,7 @@ dependencies = [
     "transformers>=4.57.1",
     "datasets>=4.4.1",
     "tokenizers>=0.22.1",
+    "einops>=0.8.1",
 ]
 
 [build-system]
