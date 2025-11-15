@@ -17,13 +17,13 @@ MODEL_CONFIGS = {
     },
     "large": {
         "d_model": 1280,
-        "num_layers": 32,
+        "num_layers": 36,
         "num_heads": 20,
         "d_ff": 5120,  # 4 * d_model
     },
     "xl": {
         "d_model": 1600,
-        "num_layers": 40,
+        "num_layers": 48,
         "num_heads": 25,
         "d_ff": 6400,  # 4 * d_model
     },
