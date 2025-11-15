@@ -5,7 +5,6 @@ description = "CS336 Assignment 2 - Systems"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "cs336-basics",
     "humanfriendly",
     "matplotlib",
     "numpy",
@@ -17,6 +16,10 @@ dependencies = [
     "wandb>=0.19.7",
     "pandas>=2",
     "ty>=0.0.1a16",
+    "jaxtyping>=0.3.3",
+    "transformers>=4.57.1",
+    "datasets>=4.4.1",
+    "tokenizers>=0.22.1",
 ]
 
 [build-system]
@@ -30,9 +33,6 @@ module-root = ""
 [tool.uv]
 package = true
 python-preference = "managed"
-
-[tool.uv.sources]
-cs336-basics = { path = "./cs336-basics", editable = true }  # Change this path to your assignment1-basics repo you want to use your own implementation!
 
 
 
