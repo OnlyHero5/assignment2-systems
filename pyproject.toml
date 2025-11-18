@@ -21,6 +21,7 @@ dependencies = [
     "datasets>=4.4.1",
     "tokenizers>=0.22.1",
     "einops>=0.8.1",
+    "nvtx>=0.2.13",
 ]
 
 [build-system]

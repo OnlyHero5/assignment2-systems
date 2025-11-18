@@ -12,6 +12,14 @@ import torch.nn as nn
 from cs336_systems.models import get_basics_transformer, count_parameters
 
 
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    print("Warning: NVTX not available. Profiling markers will be disabled.")
+
+
 
 def benchmark_model(
         model: nn.Module,
@@ -22,6 +30,7 @@ def benchmark_model(
         num_iters: int = 10,
         backward: bool = False,
         device: str = "cuda",
+        enable_nvtx: bool = False,
 ) -> Dict[str, float]:
     """
     Args:
@@ -45,54 +54,70 @@ def benchmark_model(
         target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
         criterion = nn.CrossEntropyLoss()
         model.train()
-    
-    # 热启动
-    print(f"Running {num_warmup} warmup iterations...")
-    for _ in range(num_warmup):
-        with torch.no_grad() if not backward else torch.enable_grad():
-            logits = model(inputs_ids)
 
-            if backward:
-                loss = criterion(logits.view(-1, vocab_size), target.view(-1))
-                model.zero_grad()
-                loss.backward()
-        
-        torch.cuda.synchronize()
+    # 性能分析包装函数
+    def nvtx_range(name):
+        if enable_nvtx and NVTX_AVAILABLE:
+            return nvtx.range(name)
+        else:
+            from contextlib import nullcontext
+            return nullcontext()
+    
+    # 热启动阶段
+    print(f"Running {num_warmup} warmup iterations...")
+    with nvtx_range("warmup_phase"):
+        for i in range(num_warmup):
+            with nvtx_range(f"warmup_iter_{i}"):
+                with torch.no_grad() if not backward else torch.enable_grad():
+                    with nvtx_range("warmup_forward"):
+                        logits = model(inputs_ids)
+
+                    if backward:
+                        loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                        model.zero_grad()
+                        with nvtx_range("warmup_backward"):
+                            loss.backward()
+                
+            torch.cuda.synchronize()
     # 正式测量阶段
     print(f"Running {num_iters} measurement iterations...")
     forward_times = []
     backward_times = []
     total_times = []
 
-    for i in range(num_iters):
-        if backward:
-            model.zero_grad()
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
+    with nvtx_range("measurement_phase"):
+        for i in range(num_iters):
+            with nvtx_range(f"iter_{i}"):
+                if backward:
+                    model.zero_grad()
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
 
-        logits = model(inputs_ids)
+                with nvtx_range("forward"):
+                    logits = model(inputs_ids)
 
-        torch.cuda.synchronize()
-        forward_time = time.perf_counter() - start_time
-        forward_times.append(forward_time)
+                torch.cuda.synchronize()
+                forward_time = time.perf_counter() - start_time
+                forward_times.append(forward_time)
 
-        if backward:
-            loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                if backward:
+                    loss = criterion(logits.view(-1, vocab_size), target.view(-1))
 
-            torch.cuda.synchronize()
-            backward_start = time.perf_counter()
+                    torch.cuda.synchronize()
+                    backward_start = time.perf_counter()
 
-            loss.backward()
+                    with nvtx_range("backward"):
+                        loss.backward()
 
-            torch.cuda.synchronize()
-            backward_time = time.perf_counter() - backward_start
-            backward_times.append(backward_time)
+                    torch.cuda.synchronize()
+                    backward_time = time.perf_counter() - backward_start
+                    backward_times.append(backward_time)
 
-            total_time = forward_time + backward_time
-            total_times.append(total_time)
-        
-        if (i+1) % 5 == 0:
-            print(f" Completed {i+1}/{num_iters} iterations")
+                    total_time = forward_time + backward_time
+                    total_times.append(total_time)
+            
+            if (i+1) % 5 == 0:
+                print(f" Completed {i+1}/{num_iters} iterations")
     
     results = {
         "forward_mean": np.mean(forward_times) * 1000,
@@ -166,6 +191,11 @@ def main():
         default="cuda",
         help="Device to run on"
     )
+    parser.add_argument(
+        "--enable-nvtx",
+        action="store_true",
+        help="Enable NVTX markers for Nsight profiling"
+    )
 
     args = parser.parse_args()
 
@@ -187,6 +217,7 @@ def main():
     print(f"Measure iters:       {args.num_iters}")
     print(f"Backward pass:       {args.backward}")
     print(f"Device:              {args.device}")
+    print(f"NVTX enabled:        {args.enable_nvtx}")
     print("="*60)
     print()
 
@@ -211,7 +242,8 @@ def main():
         num_warmup=args.num_warmup,
         num_iters=args.num_iters,
         backward=args.backward,
-        device=args.device
+        device=args.device,
+        enable_nvtx=args.enable_nvtx
     )
 
     print()
