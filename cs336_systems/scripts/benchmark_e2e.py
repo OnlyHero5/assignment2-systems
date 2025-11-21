@@ -73,6 +73,8 @@ def benchmark_model(
         from contextlib import nullcontext
         autocast_ctx = nullcontext()
 
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     # 热启动阶段
     print(f"Running {num_warmup} warmup iterations...")
     with nvtx_range("warmup_phase"):
@@ -91,12 +93,16 @@ def benchmark_model(
                             loss.backward()
                 
             torch.cuda.synchronize()
+            peak_bytes = torch.cuda.max_memory_allocated()
+            print(f"Peak allocated memory: {peak_bytes / 1024**3:.2f} GiB")
     # 正式测量阶段
     print(f"Running {num_iters} measurement iterations...")
     forward_times = []
     backward_times = []
     total_times = []
 
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     with nvtx_range("measurement_phase"):
         for i in range(num_iters):
             with nvtx_range(f"iter_{i}"):
@@ -132,6 +138,8 @@ def benchmark_model(
             
             if (i+1) % 5 == 0:
                 print(f" Completed {i+1}/{num_iters} iterations")
+                peak_bytes = torch.cuda.max_memory_allocated()
+                print(f"Peak allocated memory: {peak_bytes / 1024**3:.2f} GiB")
     
     results = {
         "forward_mean": np.mean(forward_times) * 1000,
