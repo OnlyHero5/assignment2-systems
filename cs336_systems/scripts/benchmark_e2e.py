@@ -30,6 +30,8 @@ def benchmark_model(
         num_iters: int = 10,
         backward: bool = False,
         device: str = "cuda",
+        enable_mixed_precision: bool = False,
+        precision_dtype: torch.dtype = torch.bfloat16,
         enable_nvtx: bool = False,
 ) -> Dict[str, float]:
     """
@@ -63,6 +65,14 @@ def benchmark_model(
             from contextlib import nullcontext
             return nullcontext()
     
+    # 准备AutoCast
+    if enable_mixed_precision and device == "cuda":
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=precision_dtype)
+        print(f"启用混合精度: {precision_dtype}")
+    else:
+        from contextlib import nullcontext
+        autocast_ctx = nullcontext()
+
     # 热启动阶段
     print(f"Running {num_warmup} warmup iterations...")
     with nvtx_range("warmup_phase"):
@@ -94,14 +104,16 @@ def benchmark_model(
                 start_time = time.perf_counter()
 
                 with nvtx_range("forward"):
-                    logits = model(inputs_ids)
+                    with autocast_ctx:
+                        logits = model(inputs_ids)
 
                 torch.cuda.synchronize()
                 forward_time = time.perf_counter() - start_time
                 forward_times.append(forward_time)
 
                 if backward:
-                    loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                    with autocast_ctx:
+                        loss = criterion(logits.view(-1, vocab_size), target.view(-1))
 
                     torch.cuda.synchronize()
                     backward_start = time.perf_counter()
@@ -196,6 +208,16 @@ def main():
         action="store_true",
         help="Enable NVTX markers for Nsight profiling"
     )
+    parser.add_argument(
+        "--enable-mixed-precision",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--precision_dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "fp32", "bf16"]
+    )
 
     args = parser.parse_args()
 
@@ -218,6 +240,8 @@ def main():
     print(f"Backward pass:       {args.backward}")
     print(f"Device:              {args.device}")
     print(f"NVTX enabled:        {args.enable_nvtx}")
+    print(f"Mixed_precision enabled: {args.enable_mixed_precision}")
+    print(f"Precision dtype:     {args.precision_dtype}")
     print("="*60)
     print()
 
@@ -234,6 +258,12 @@ def main():
     print(f"Total parameters: {total_params:,}")
     print()
 
+    dtype_map = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32
+    }
+
     results = benchmark_model(
         model=model,
         batch_size=args.batch_size,
@@ -243,7 +273,9 @@ def main():
         num_iters=args.num_iters,
         backward=args.backward,
         device=args.device,
-        enable_nvtx=args.enable_nvtx
+        enable_nvtx=args.enable_nvtx,
+        enable_mixed_precision=args.enable_mixed_precision,
+        precision_dtype=dtype_map[args.precision_dtype]
     )
 
     print()
