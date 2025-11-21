@@ -80,10 +80,12 @@ def benchmark_model(
             with nvtx_range(f"warmup_iter_{i}"):
                 with torch.no_grad() if not backward else torch.enable_grad():
                     with nvtx_range("warmup_forward"):
-                        logits = model(inputs_ids)
+                        with autocast_ctx:
+                            logits = model(inputs_ids)
 
                     if backward:
-                        loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                        with autocast_ctx:
+                            loss = criterion(logits.view(-1, vocab_size), target.view(-1))
                         model.zero_grad()
                         with nvtx_range("warmup_backward"):
                             loss.backward()
