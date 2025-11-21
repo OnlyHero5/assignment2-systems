@@ -287,6 +287,8 @@ class RoPE(nn.Module):
         返回:
             旋转后的张量 (..., d_head)
         """
+        cos = cos.to(x_real.dtype)
+        sin = sin.to(x_real.dtype)
         x_rotated_real = x_real * cos - x_imag * sin
         x_rotated_imag = x_real * sin + x_imag * cos
 
